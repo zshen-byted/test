@@ -1,0 +1,103 @@
+
+============================================================
+>>> Model A 前向
+
+[model_A] 原始 aot forward graph (含 marker):
+opcode         name       target                   args                              kwargs
+-------------  ---------  -----------------------  --------------------------------  --------
+placeholder    primals_1  primals_1                ()                                {}
+placeholder    primals_2  primals_2                ()                                {}
+placeholder    primals_3  primals_3                ()                                {}
+call_function  t          aten.t.default           (primals_1,)                      {}
+call_function  addmm      aten.addmm.default       (primals_2, primals_3, t)         {}
+call_function  marker     xpugraph.marker.default  (addmm, 0)                        {}
+call_function  relu       aten.relu.default        (marker,)                         {}
+call_function  detach     aten.detach.default      (relu,)                           {}
+call_function  marker_1   xpugraph.marker.default  (relu, 1)                         {}
+output         output     output                   ((marker_1, primals_3, detach),)  {}
+
+[model_A] 删除 marker 后:
+opcode         name       target               args                          kwargs
+-------------  ---------  -------------------  ----------------------------  --------
+placeholder    primals_1  primals_1            ()                            {}
+placeholder    primals_2  primals_2            ()                            {}
+placeholder    primals_3  primals_3            ()                            {}
+call_function  t          aten.t.default       (primals_1,)                  {}
+call_function  addmm      aten.addmm.default   (primals_2, primals_3, t)     {}
+call_function  relu       aten.relu.default    (addmm,)                      {}
+call_function  detach     aten.detach.default  (relu,)                       {}
+output         output     output               ((relu, primals_3, detach),)  {}
+
+[model_A] 插入 instrument 后:
+opcode         name                  target                       args                          kwargs
+-------------  --------------------  ---------------------------  ----------------------------  --------
+placeholder    primals_1             primals_1                    ()                            {}
+placeholder    primals_2             primals_2                    ()                            {}
+placeholder    primals_3             primals_3                    ()                            {}
+call_function  t                     aten.t.default               (primals_1,)                  {}
+call_function  addmm                 aten.addmm.default           (primals_2, primals_3, t)     {}
+call_function  instrument_default    xpugraph.instrument.default  (addmm, 0, 'model_A')         {}
+call_function  relu                  aten.relu.default            (addmm,)                      {}
+call_function  instrument_default_1  xpugraph.instrument.default  (relu, 1, 'model_A')          {}
+call_function  detach                aten.detach.default          (relu,)                       {}
+output         output                output                       ((relu, primals_3, detach),)  {}
+
+>>> Model B 前向
+
+[model_B] 原始 aot forward graph (含 marker):
+opcode         name       target                   args                              kwargs
+-------------  ---------  -----------------------  --------------------------------  --------
+placeholder    primals_1  primals_1                ()                                {}
+placeholder    primals_2  primals_2                ()                                {}
+placeholder    primals_3  primals_3                ()                                {}
+call_function  t          aten.t.default           (primals_1,)                      {}
+call_function  addmm      aten.addmm.default       (primals_2, primals_3, t)         {}
+call_function  marker     xpugraph.marker.default  (addmm, 0)                        {}
+call_function  relu       aten.relu.default        (marker,)                         {}
+call_function  detach     aten.detach.default      (relu,)                           {}
+call_function  marker_1   xpugraph.marker.default  (relu, 1)                         {}
+output         output     output                   ((marker_1, primals_3, detach),)  {}
+
+[model_B] 删除 marker 后:
+opcode         name       target               args                          kwargs
+-------------  ---------  -------------------  ----------------------------  --------
+placeholder    primals_1  primals_1            ()                            {}
+placeholder    primals_2  primals_2            ()                            {}
+placeholder    primals_3  primals_3            ()                            {}
+call_function  t          aten.t.default       (primals_1,)                  {}
+call_function  addmm      aten.addmm.default   (primals_2, primals_3, t)     {}
+call_function  relu       aten.relu.default    (addmm,)                      {}
+call_function  detach     aten.detach.default  (relu,)                       {}
+output         output     output               ((relu, primals_3, detach),)  {}
+
+[model_B] 插入 instrument 后:
+opcode         name                  target                       args                          kwargs
+-------------  --------------------  ---------------------------  ----------------------------  --------
+placeholder    primals_1             primals_1                    ()                            {}
+placeholder    primals_2             primals_2                    ()                            {}
+placeholder    primals_3             primals_3                    ()                            {}
+call_function  t                     aten.t.default               (primals_1,)                  {}
+call_function  addmm                 aten.addmm.default           (primals_2, primals_3, t)     {}
+call_function  instrument_default    xpugraph.instrument.default  (addmm, 0, 'model_B')         {}
+call_function  relu                  aten.relu.default            (addmm,)                      {}
+call_function  instrument_default_1  xpugraph.instrument.default  (relu, 1, 'model_B')          {}
+call_function  detach                aten.detach.default          (relu,)                       {}
+output         output                output                       ((relu, primals_3, detach),)  {}
+
+============================================================
+对齐结果对比:
+============================================================
+
+  AlignmentNode(id=0), step=0:
+    model_A  xorsum=0x87C17ECC  shape=torch.Size([4, 16])  dtype=torch.float32
+    model_B  xorsum=0x87C17ECC  shape=torch.Size([4, 16])  dtype=torch.float32
+    bitwise=True  allclose=True  => [PASS]
+
+  AlignmentNode(id=1), step=0:
+    model_A  xorsum=0x3E0FEA14  shape=torch.Size([4, 16])  dtype=torch.float32
+    model_B  xorsum=0x3E0FEA14  shape=torch.Size([4, 16])  dtype=torch.float32
+    bitwise=True  allclose=True  => [PASS]
+
+============================================================
+总结: ALL PASSED ✓
+============================================================
