@@ -5,3 +5,10 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# IDEs
+.idea/
+.vscode/
+
+# UV
+.venv/

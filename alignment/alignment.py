@@ -1,9 +1,6 @@
-import functools
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.library import Library
 
 import torch._dynamo as dynamo
 from torch._functorch.aot_autograd import aot_module_simplified
@@ -11,11 +8,13 @@ from torch._dynamo.backends.common import aot_autograd
 
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.overrides import TorchFunctionMode
-from torch._subclasses.fake_tensor import FakeTensorMode
 
 import numpy as np
-import collections
-from typing import Optional, Tuple, List, NamedTuple
+from typing import Optional
+
+import sys,os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from model.llama3 import Llama3
 
 
 # dynamo.config.error_on_recompile = True
@@ -99,26 +98,30 @@ class AlignmentManager:
         for i in range(list(cls._nodes.values())[0].data.__len__()):
             print(f"\n{'='*40}\nStep {i}\n{'='*40}")
             for node_id, align_node in sorted(cls._nodes.items()):
-                print(f"AlignmentNode {node_id}:")
-                gold_data = align_node.data.get(gold_model_id, [])
-                if not gold_data:
-                    print(f"  Gold model {gold_model_id} has no data collected for this node.")
-                    continue
-                for model_id in model_ids:
-                    data = align_node.data.get(model_id, [])
-                    if not data:
-                        print(f"  {model_id}: No data collected")
+                try:
+                    print(f"AlignmentNode {node_id}:")
+                    gold_data = align_node.data.get(gold_model_id, [])
+                    if not gold_data:
+                        print(f"  Gold model {gold_model_id} has no data collected for this node.")
                         continue
-                    print(f"  {model_id+(' (gold)' if model_id == gold_model_id else ''):15}:", end="")
-                    (xorsum, raw_tensor) = data[i]
-                    gold_xorsum, gold_tensor = gold_data[i]
-                    raw_tensor_32, gold_tensor_32 = raw_tensor.to(torch.float32), gold_tensor.to(torch.float32)
+                    for model_id in model_ids:
+                        data = align_node.data.get(model_id, [])
+                        if not data:
+                            print(f"  {model_id}: No data collected")
+                            continue
+                        print(f"  {model_id+(' (gold)' if model_id == gold_model_id else ''):15}:", end="")
+                        (xorsum, raw_tensor) = data[i]
+                        gold_xorsum, gold_tensor = gold_data[i]
+                        raw_tensor_32, gold_tensor_32 = raw_tensor.to(torch.float32), gold_tensor.to(torch.float32)
 
-                    max_diff:float = (raw_tensor_32 - gold_tensor_32).abs().max().item()
-                    closeto:bool = torch.allclose(raw_tensor_32, gold_tensor_32, rtol=1e-3, atol=1e-5)
+                        max_diff:float = (raw_tensor_32 - gold_tensor_32).abs().max().item()
+                        closeto:bool = torch.allclose(raw_tensor_32, gold_tensor_32, rtol=1e-3, atol=1e-5)
 
-                    print(f"dtype={raw_tensor.dtype}, xorsum=0x{xorsum:08X}, max_diff={max_diff:.8f}, closeto={str(closeto):5}")
-                print("")
+                        print(f"dtype={raw_tensor.dtype}, xorsum=0x{xorsum:08X}, max_diff={max_diff:.8f}, closeto={str(closeto):5}")
+                    print("")
+                except Exception as e:
+                    print("\n")
+                    continue
 
     @staticmethod
     def xorsum32(t: torch.Tensor) -> int:
@@ -174,7 +177,6 @@ class AlignmentManager:
         return gm
 
 
-
 class AlignedModelGenerator:
 
     class MarkerInjectFuntionMode(TorchFunctionMode):
@@ -195,6 +197,8 @@ class AlignedModelGenerator:
                 return False
             if not isinstance(result, torch.Tensor):
                 return False
+            if result.dtype not in [torch.float16, torch.bfloat16, torch.float32]:
+                return False
             return True
     
     class EagerInstrumentFunctionMode(TorchFunctionMode):
@@ -208,7 +212,7 @@ class AlignedModelGenerator:
         def __torch_function__(self, func, types, args=(), kwargs=None):
             result = func(*args, **(kwargs or {}))
             
-            if isinstance(result, torch.Tensor):
+            if isinstance(result, torch.Tensor) and result.dtype in [torch.float16, torch.bfloat16, torch.float32]:
                 node_id = self._next_node_id
                 self._next_node_id += 1
                 # call instrument op directly to collect data in eager mode
@@ -234,18 +238,15 @@ class AlignedModelGenerator:
     def _make_backend(self):
 
         def alignment_fw_compiler(gm: torch.fx.GraphModule, example_inputs):
+            print("\n\n=== Original Graph ===", flush=True)
             gm.graph.print_tabular()
 
-            print("", flush=True)
-            print("\n=== Injecting marker meta and removing marker nodes ===", flush=True)
             gm = self.align_mgr.inject_marker_meta_and_remove_marker_pass(gm)
-            gm.graph.print_tabular()
-
-            print("", flush=True)
-            print("\n=== Inserting instrument nodes ===", flush=True)
+            # any optimization should between marker pass and instrument pass.
             gm = self.align_mgr.insert_instrument_nodes_pass(gm, self.model_id)
+
+            print("\n\n=== Instrumented Graph ===", flush=True)
             gm.graph.print_tabular()
-            print("", flush=True)
 
             return gm.forward
 
@@ -314,7 +315,7 @@ class AlignedModelGenerator:
         self._generated = True
         return _WrapModule(model)
 
-class MyModel(nn.Module):
+class ToyModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.linear = nn.Linear(16, 16)
@@ -334,29 +335,29 @@ if __name__ == "__main__":
 
     # Model A: eager float32
     with torch.random.fork_rng():
-        model_a = AlignedModelGenerator("eager_A").get_eager(MyModel())
+        model_a = AlignedModelGenerator("eager_A").get_eager(Llama3(vocab_size=64, dim=128, n_layers=1, n_heads=4, n_kv_heads=4))
 
     # Model A: compiled float32
     with torch.random.fork_rng():
-        compiled_a = AlignedModelGenerator("compiled_A").get_compiled(MyModel(), (torch.randn(4, 16),))
+        compiled_a = AlignedModelGenerator("compiled_A").get_compiled(Llama3(vocab_size=64, dim=128, n_layers=1, n_heads=4, n_kv_heads=4), (torch.randint(0, 64, (4, 16)),))
 
     # Model B: eager float16
     with torch.random.fork_rng():
-        model_b = AlignedModelGenerator("eager_B").get_eager(MyModel().half())
+        model_b = AlignedModelGenerator("eager_B").get_eager(Llama3(vocab_size=64, dim=128, n_layers=1, n_heads=4, n_kv_heads=4).half())
     
     # Model B: compiled float16
     with torch.random.fork_rng():
-        compiled_b = AlignedModelGenerator("compiled_B").get_compiled(MyModel().half(), (torch.randn(4, 16).half(),))
+        compiled_b = AlignedModelGenerator("compiled_B").get_compiled(Llama3(vocab_size=64, dim=128, n_layers=1, n_heads=4, n_kv_heads=4).half(), (torch.randint(0, 64, (4, 16)),))
 
 
     for i in range(10):
-        x = torch.randn(4, 16)
+        x = torch.randint(0, 64, (4, 16))
 
         _ = model_a(x.clone())
         _ = compiled_a(x.clone())
-        _ = model_b(x.clone().half())
-        _ = compiled_b(x.clone().half())
+        _ = model_b(x.clone())
+        _ = compiled_b(x.clone())
 
 
-    print(f"\n{'='*60}\n对齐结果对比:\n{'='*60}")
     mgr.print_data_comparison(["eager_A", "compiled_A", "eager_B", "compiled_B"], gold_model_id="eager_A")
+    # mgr.print_data_comparison(["eager_A", "compiled_A"], gold_model_id="eager_A")
