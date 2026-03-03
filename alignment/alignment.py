@@ -3,13 +3,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.library import Library
 
+import torch._dynamo as dynamo
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch._dynamo.backends.common import aot_autograd
 
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.overrides import TorchFunctionMode
+from torch._subclasses.fake_tensor import FakeTensorMode
+
 import numpy as np
-from typing import Optional
+import collections
+from typing import Optional, Tuple, List, NamedTuple
 
 
+dynamo.config.error_on_recompile = True
 
 class AlignmentNode:
     def __init__(self, id:int):
@@ -21,8 +28,6 @@ class AlignmentNode:
 class AlignmentManager:
     _instance: Optional["AlignmentManager"] = None
     _nodes: dict[int, dict] = {}
-    _next_id: int = 0
-
 
     def __new__(cls):
         if cls._instance is None:
@@ -32,7 +37,6 @@ class AlignmentManager:
 
     def __init__(self):
         pass
-
 
     @classmethod
     def _register_ops(cls):
@@ -44,7 +48,7 @@ class AlignmentManager:
         # register fake
         @xpugraph_marker.register_fake
         def xpugraph_marker_fake(x: torch.Tensor, node_id: int) -> torch.Tensor:
-            return torch.empty_like(x)
+            return x.clone()
         # register autograd
         def xpugraph_marker_setup_context(ctx, inputs, output):
             pass
@@ -66,21 +70,20 @@ class AlignmentManager:
                 cls.xorsum32(x), 
                 x.clone().detach()
             ))
-            return x.clone()
+            return torch.empty(0)
         # register fake
         @xpugraph_instrument.register_fake
         def xpugraph_instrument_fake(x: torch.Tensor, node_id: int, model_id: str) -> torch.Tensor:
-            return torch.empty_like(x)
+            return torch.empty(0)
         # register autograd
         def xpugraph_instrument_setup_context(ctx, inputs, output):
             pass
         def xpugraph_instrument_backward(ctx, grad_output):
-            return grad_output, None, None  # 对 x 透传梯度, node_id/model_id 无梯度
+            return None, None, None
         xpugraph_instrument.register_autograd(
             xpugraph_instrument_backward,
             setup_context=xpugraph_instrument_setup_context,
         )
-
 
     @classmethod
     def get_node(cls, node_id: int) -> AlignmentNode:
@@ -88,6 +91,29 @@ class AlignmentManager:
             cls._nodes[node_id] = AlignmentNode(node_id)
         return cls._nodes[node_id]
 
+    @classmethod
+    def print_data_comparison(cls, model_ids: list[str], gold_model_id: Optional[str] = None):
+        gold_model_id = gold_model_id if gold_model_id is not None else model_ids[0]
+        for node_id, align_node in sorted(cls._nodes.items()):
+            print(f"\nAlignmentNode {node_id}:")
+            gold_data = align_node.data.get(gold_model_id, [])
+            if not gold_data:
+                print(f"  Gold model {gold_model_id} has no data collected for this node.")
+                continue
+            for model_id in model_ids:
+                data = align_node.data.get(model_id, [])
+                if not data:
+                    print(f"  {model_id}: No data collected")
+                    continue
+                print(f"  {model_id}{' (gold)' if model_id == gold_model_id else '':8}:", end="")
+                for i, (xorsum, raw_tensor) in enumerate(data):
+                    gold_xorsum, gold_tensor = gold_data[i]
+                    raw_tensor_32, gold_tensor_32 = raw_tensor.to(torch.float32), gold_tensor.to(torch.float32)
+
+                    max_diff:float = (raw_tensor_32 - gold_tensor_32).abs().max().item()
+                    closeto:bool = torch.allclose(raw_tensor_32, gold_tensor_32, rtol=1e-3, atol=1e-5)
+
+                    print(f"dtype={raw_tensor.dtype}, xorsum=0x{xorsum:08X}, max_diff={max_diff:.8f}, closeto={str(closeto):5}")
 
     @staticmethod
     def xorsum32(t: torch.Tensor) -> int:
@@ -98,7 +124,8 @@ class AlignmentManager:
         return int(np.bitwise_xor.reduce(u32.numpy(), dtype=np.uint64)) & 0xFFFFFFFF
 
 
-def inject_marker_meta_and_remove_marker(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+
+def inject_marker_meta_and_remove_marker_pass(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     graph = gm.graph
     markers_to_remove = []
 
@@ -109,9 +136,9 @@ def inject_marker_meta_and_remove_marker(gm: torch.fx.GraphModule) -> torch.fx.G
             node_id: int = node.args[1]
 
             # 注入 alignment node_id 到被 mark 的算子的 meta 中
-            if "alignment_node_ids" not in source_node.meta:
-                source_node.meta["alignment_node_ids"] = []
-            source_node.meta["alignment_node_ids"].append(node_id)
+            if "align_node_ids" not in source_node.meta:
+                source_node.meta["align_node_ids"] = []
+            source_node.meta["align_node_ids"].append(node_id)
 
             # marker 的输出直接替换为其输入（bypass marker）
             node.replace_all_uses_with(source_node)
@@ -125,12 +152,12 @@ def inject_marker_meta_and_remove_marker(gm: torch.fx.GraphModule) -> torch.fx.G
     return gm
 
 
-def insert_instrument_nodes(gm: torch.fx.GraphModule, model_id: str) -> torch.fx.GraphModule:
+def insert_instrument_nodes_pass(gm: torch.fx.GraphModule, model_id: str) -> torch.fx.GraphModule:
     graph = gm.graph
 
     for node in list(graph.nodes):
-        alignment_ids = node.meta.get("alignment_node_ids", [])
-        for node_id in alignment_ids:
+        align_node_ids = node.meta.get("align_node_ids", [])
+        for node_id in align_node_ids:
             with graph.inserting_after(node):
                 instrument_node = graph.call_function(
                     torch.ops.xpugraph.instrument.default,
@@ -141,6 +168,74 @@ def insert_instrument_nodes(gm: torch.fx.GraphModule, model_id: str) -> torch.fx
     gm.recompile()
     return gm
 
+class AlignmentManagerContext(TorchFunctionMode):
+    def __init__(self, model_id: str, function_inject=False, module_hook_inject=False, module:Optional[nn.Module]=None):
+        super().__init__()
+        self.model_id = model_id
+        self.align_mgr = AlignmentManager()
+        self._next_node_id = 0
+        self.function_inject = function_inject
+        #TODO module_hook_inject
+    
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        result = func(*args, **(kwargs or {}))
+        if self._should_inject_function_marker(func, types, result):
+            result = torch.ops.xpugraph.marker(result, self._new_node_id())
+        return result
+
+    def _should_inject_function_marker(self, func, types, result) -> bool:
+        ret = self.function_inject
+        if not isinstance(result, torch.Tensor):
+            ret = False
+
+        return ret
+
+    def _new_node_id(self):
+        ret = self._next_node_id
+        self._next_node_id += 1
+        return ret
+
+    def get_backend(self):
+        def alignment_fw_compiler(gm: torch.fx.GraphModule, example_inputs):
+            gm.graph.print_tabular()
+            
+            print("", flush=True)
+            print("\n=== Injecting marker meta and removing marker nodes ===", flush=True)
+            gm = inject_marker_meta_and_remove_marker_pass(gm)
+            gm.graph.print_tabular()
+            
+            print("", flush=True)
+            print("\n=== Inserting instrument nodes ===", flush=True)
+            gm = insert_instrument_nodes_pass(gm, self.model_id)
+            gm.graph.print_tabular()
+            print("", flush=True)
+
+
+            return gm.forward
+
+        def alignment_bw_compiler(gm: torch.fx.GraphModule, example_inputs):
+            return gm.forward
+
+        def backend(gm: torch.fx.GraphModule, example_inputs):
+
+            gm = aot_module_simplified(
+                gm,
+                example_inputs,
+                fw_compiler=alignment_fw_compiler,
+                bw_compiler=alignment_bw_compiler,
+            )
+
+            tracing_context = torch._guards.TracingContext.try_get()
+            orig_guards:torch._guards.GuardsSet= tracing_context.guards_context.dynamo_guards
+            filter_flags = [False for _ in orig_guards]
+            filtered_guards = torch._guards.GuardsSet(
+                set(guard for guard, flag in zip(orig_guards, filter_flags) if not flag)
+            )
+            tracing_context.guards_context.dynamo_guards = orig_guards - filtered_guards
+
+            return gm
+        return backend
+
 
 class MyModel(nn.Module):
     def __init__(self):
@@ -149,98 +244,61 @@ class MyModel(nn.Module):
 
     def forward(self, x):
         out = self.linear(x)
-        # 插入 marker: 标记 linear 输出，绑定 alignment node 0
-        out = torch.ops.xpugraph.marker(out, 0)
         out = torch.relu(out)
-        # 插入 marker: 标记 relu 输出，绑定 alignment node 1
-        out = torch.ops.xpugraph.marker(out, 1)
         return out
 
+
 if __name__ == "__main__":
+
+    SEED = 42
+    torch.manual_seed(SEED)
     
     mgr = AlignmentManager()
 
-    def make_alignment_backend(model_id: str):
-        def alignment_fw_compiler(gm: torch.fx.GraphModule, example_inputs):
-            print(f"\n[{model_id}] 原始 aot forward graph (含 marker):")
-            gm.graph.print_tabular()
-
-            gm = inject_marker_meta_and_remove_marker(gm)
-            print(f"\n[{model_id}] 删除 marker 后:")
-            gm.graph.print_tabular()
-
-            gm = insert_instrument_nodes(gm, model_id)
-            print(f"\n[{model_id}] 插入 instrument 后:")
-            gm.graph.print_tabular()
-
-            return gm.forward
-
-        def alignment_bw_compiler(gm: torch.fx.GraphModule, example_inputs):
-            return gm.forward
-
-        from torch._dynamo.backends.common import aot_autograd as make_aot_backend
-        return make_aot_backend(
-            fw_compiler=alignment_fw_compiler,
-            bw_compiler=alignment_bw_compiler,
-        )
-
-    # ---- 构建两个相同权重的 model，用不同 model_id 编译 ----
-    SEED = 42
-
     # Model A: 原始 float32
-    torch.manual_seed(SEED)
-    model_a = MyModel()
-    compiled_a = torch.compile(model_a, backend=make_alignment_backend("model_A"))
+    with torch.random.fork_rng():
+        model_a = MyModel()
+        input = torch.randn(4, 16)
+        with AlignmentManagerContext("model_A", function_inject=True) as am_ctx:
+            compiled_a = torch.compile(model_a, backend=am_ctx.get_backend(), dynamic=True, fullgraph=True, )
+            _ = compiled_a(input)
 
-    # Model B: 模拟另一个 device/精度（这里同样 float32，保证 bitwise 对齐）
-    torch.manual_seed(SEED)
-    model_b = MyModel()
-    compiled_b = torch.compile(model_b, backend=make_alignment_backend("model_B"))
 
-    # ---- 同一随机输入，各跑一步 ----
-    torch.manual_seed(SEED)
+    print("\n=== Running inference to collect data ===", flush=True)
+
     x = torch.randn(4, 16)
 
-    print("\n" + "=" * 60)
-    print(">>> Model A 前向")
     y_a = compiled_a(x.clone())
 
-    print("\n>>> Model B 前向")
-    y_b = compiled_b(x.clone())
 
-    # ---- 对比两个 model 在每个 AlignmentNode 上的记录 ----
-    print("\n" + "=" * 60)
-    print("对齐结果对比:")
-    print("=" * 60)
+    # # Model B: 同样的模型
+    # with torch.random.fork_rng():
+    #     model_b = MyModel()
+    #     input = torch.randn(4, 16)
+    #     with AlignmentManagerContext("model_B", function_inject=True) as am_ctx:
+    #         compiled_b = torch.compile(model_b, backend=am_ctx.get_backend(), dynamic=True, fullgraph=True)
+    #         _ = compiled_b(input)
 
-    all_pass = True
-    for node_id, align_node in sorted(mgr._nodes.items()):
-        data_a = align_node.data.get("model_A", [])
-        data_b = align_node.data.get("model_B", [])
+    # # Model C: 量化到float16
+    # with torch.random.fork_rng():
+    #     model_c = MyModel().half()
+    #     input = torch.randn(4, 16).half()
+    #     with AlignmentManagerContext("model_C", function_inject=True) as am_ctx:
+    #         compiled_c = torch.compile(model_c, backend=am_ctx.get_backend(), dynamic=True, fullgraph=True)
+    #         _ = compiled_c(input)
 
-        if len(data_a) != len(data_b):
-            print(f"\n  [FAIL] AlignmentNode(id={node_id}): 记录数不一致 "
-                  f"(model_A={len(data_a)}, model_B={len(data_b)})")
-            all_pass = False
-            continue
+    print("\n=== Running inference to collect data ===", flush=True)
 
-        for step, ((xorsum_a, tensor_a), (xorsum_b, tensor_b)) in enumerate(zip(data_a, data_b)):
-            bitwise_match = (xorsum_a == xorsum_b)
-            close_match = torch.allclose(tensor_a, tensor_b, atol=1e-6, rtol=1e-5)
+    x = torch.randn(4, 16)
 
-            status = "PASS" if bitwise_match else ("CLOSE" if close_match else "FAIL")
-            if status != "PASS":
-                all_pass = False
+    y_a = compiled_a(x.clone())
 
-            print(f"\n  AlignmentNode(id={node_id}), step={step}:")
-            print(f"    model_A  xorsum=0x{xorsum_a:08X}  shape={tensor_a.shape}  dtype={tensor_a.dtype}")
-            print(f"    model_B  xorsum=0x{xorsum_b:08X}  shape={tensor_b.shape}  dtype={tensor_b.dtype}")
-            print(f"    bitwise={bitwise_match}  allclose={close_match}  => [{status}]")
+    # y_b = compiled_b(x.clone())
 
-            if not bitwise_match:
-                diff = (tensor_a - tensor_b).abs()
-                print(f"    max_diff={diff.max().item():.6e}  mean_diff={diff.mean().item():.6e}")
+    # y_c = compiled_c(x.clone().half())
 
-    print("\n" + "=" * 60)
-    print(f"总结: {'ALL PASSED ✓' if all_pass else 'SOME FAILED ✗'}")
-    print("=" * 60)
+
+    # # ----  对比所有model 在每个 AlignmentNode 上的记录 ----
+    # print(f"\n{'='*60}\n对齐结果对比:\n{'='*60}")
+
+    # mgr.print_data_comparison(["model_A", "model_B", "model_C"])
