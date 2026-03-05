@@ -1,4 +1,5 @@
 *.log
+*.dot
 
 # python
 __pycache__/
