@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import functorch
 
 import torch._dynamo as dynamo
 from torch._functorch.aot_autograd import aot_module_simplified
@@ -461,7 +462,7 @@ class AlignedModelGenerator:
             print("\n\n=== Forward Instrumented Graph ===", flush=True)
             gm.graph.print_tabular()
 
-            return gm.forward
+            return functorch.compile.make_boxed_func(gm.forward)
 
         def alignment_bw_compiler(gm: torch.fx.GraphModule, example_inputs):
             bw_offset = fw_marker_count[0]  # total forward marker count
@@ -472,7 +473,7 @@ class AlignedModelGenerator:
             print("\n\n=== Backward Instrumented Graph ===", flush=True)
             gm.graph.print_tabular()
 
-            return gm.forward
+            return functorch.compile.make_boxed_func(gm.forward)
 
         def backend(gm: torch.fx.GraphModule, example_inputs):
             gm = aot_module_simplified(
